@@ -1,24 +1,19 @@
 /**
- * Care Guides Proxy (v2.2.2)
+ * Care Guides Proxy (v2.3.0)
  *
  * ✔ Smart HTML landing page (default)
  * ✔ JSON via ?format=json
  * ✔ ROOT fallback if Shopify proxy points to "/"
- * ✔ CORRECT Shopify App Proxy signature verification
+ * ✔ NO Shopify signature enforcement (intentional)
  * ✔ Supports full URLs in query params
  * ✔ NO Admin API token
  * ✔ NO Storefront token
  */
 
 import express from "express";
-import crypto from "crypto";
 
 const app = express();
-const VERSION = "2.2.2";
-
-// Accept either env var name
-const SHOPIFY_API_SECRET =
-  process.env.SHOPIFY_API_SECRET || process.env.SHOPIFY_APP_PROXY_SECRET;
+const VERSION = "2.3.0";
 
 const { PORT, NODE_ENV, RENDER_GIT_COMMIT } = process.env;
 
@@ -26,68 +21,8 @@ const { PORT, NODE_ENV, RENDER_GIT_COMMIT } = process.env;
 /* Helpers                                            */
 /* -------------------------------------------------- */
 
-function envOk() {
-  return Boolean(SHOPIFY_API_SECRET);
-}
-
 function nowIso() {
   return new Date().toISOString();
-}
-
-function hasProxySignature(query) {
-  return Boolean(query && query.signature);
-}
-
-/**
- * CRITICAL:
- * Shopify App Proxy signs the RAW query string.
- * We must verify against req.originalUrl (not req.query).
- */
-function verifyShopifyProxySignatureFromReq(req, secret) {
-  const originalUrl = req.originalUrl || "";
-  const qIndex = originalUrl.indexOf("?");
-
-  if (qIndex === -1) return { ok: false, reason: "Missing signature" };
-
-  const rawQuery = originalUrl.slice(qIndex + 1);
-  const parts = rawQuery.split("&").filter(Boolean);
-
-  let signature = null;
-  const unsignedParts = [];
-
-  for (const part of parts) {
-    const eq = part.indexOf("=");
-    const key = eq === -1 ? part : part.slice(0, eq);
-
-    if (key === "signature") {
-      signature = eq === -1 ? "" : part.slice(eq + 1);
-      continue;
-    }
-    unsignedParts.push(part); // keep RAW key=value
-  }
-
-  if (!signature) return { ok: false, reason: "Missing signature" };
-
-  unsignedParts.sort((a, b) => {
-    const ak = a.split("=", 1)[0];
-    const bk = b.split("=", 1)[0];
-    return ak < bk ? -1 : ak > bk ? 1 : 0;
-  });
-
-  const message = unsignedParts.join("&");
-
-  const digest = crypto
-    .createHmac("sha256", secret)
-    .update(message)
-    .digest("hex");
-
-  const sig = String(signature);
-
-  const safeEqual =
-    digest.length === sig.length &&
-    crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(sig));
-
-  return safeEqual ? { ok: true } : { ok: false, reason: "Invalid signature" };
 }
 
 function parseGuides(req) {
@@ -152,7 +87,7 @@ function titleFromUrl(url) {
   }
 }
 
-function renderHtml({ guides, signed }) {
+function renderHtml({ guides }) {
   const items = guides
     .map(
       (url) => `
@@ -195,7 +130,7 @@ function renderHtml({ guides, signed }) {
     ${guides.length ? `<ul>${items}</ul>` : `<p>No care guides were found.</p>`}
     <div class="meta">
       <div>Belgrave Orchids</div>
-      <div>${signed ? "Verified via Shopify" : "Public link"}</div>
+      <div>Public link</div>
     </div>
   </div>
 </div>
@@ -208,38 +143,17 @@ function renderHtml({ guides, signed }) {
 /* -------------------------------------------------- */
 
 function handleCareGuides(req, res) {
-  if (!envOk()) {
-    return res.status(500).json({
-      ok: false,
-      error: "Server not configured",
-      detail: "Missing SHOPIFY_API_SECRET",
-    });
-  }
-
-  let signed = false;
-  if (hasProxySignature(req.query)) {
-    signed = true;
-    const verified = verifyShopifyProxySignatureFromReq(req, SHOPIFY_API_SECRET);
-    if (!verified.ok) {
-      return res.status(401).json({
-        ok: false,
-        error: "Unauthorized",
-        detail: verified.reason,
-      });
-    }
-  }
-
   const guides = parseGuides(req);
 
   if (wantsJson(req)) {
     return res.status(200).json({
       ok: true,
       guides,
-      meta: { signed, count: guides.length },
+      meta: { count: guides.length },
     });
   }
 
-  return res.status(200).type("text/html").send(renderHtml({ guides, signed }));
+  return res.status(200).type("text/html").send(renderHtml({ guides }));
 }
 
 /* -------------------------------------------------- */
@@ -247,7 +161,7 @@ function handleCareGuides(req, res) {
 /* -------------------------------------------------- */
 
 app.get("/", (req, res) => {
-  // Root fallback for mis-pointed App Proxy
+  // Root fallback for Shopify App Proxy
   if (req.query.guides || req.query.guide) {
     return handleCareGuides(req, res);
   }
@@ -256,7 +170,6 @@ app.get("/", (req, res) => {
     [
       "Care Guides Proxy – Status OK",
       `Version: ${VERSION}`,
-      `Env OK: ${envOk() ? "yes" : "NO (missing SHOPIFY_API_SECRET)"}`,
       `Time: ${nowIso()}`,
       `Node env: ${NODE_ENV || "unknown"}`,
     ].join("\n")
@@ -266,8 +179,8 @@ app.get("/", (req, res) => {
 app.get("/care-guides", handleCareGuides);
 
 app.get("/healthz", (req, res) => {
-  res.status(envOk() ? 200 : 500).json({
-    ok: envOk(),
+  res.status(200).json({
+    ok: true,
     version: VERSION,
     commit: RENDER_GIT_COMMIT || null,
     time: nowIso(),

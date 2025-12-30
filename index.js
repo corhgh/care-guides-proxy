@@ -1,212 +1,224 @@
 /**
- * Care Guides Proxy (Shopify App Proxy signed requests)
+ * Belgrave Orchids — Care Guides Proxy (v2)
+ * - Express service on Render
+ * - Shopify App Proxy endpoint: GET /care-guides
+ * - Optional public access: via subdomain (no signature present)
  *
- * Shopify App Proxy calls include query params + a signature.
- * We verify signature using your app API Secret (NOT admin token).
+ * Env:
+ *   SHOPIFY_API_SECRET
+ *   SHOPIFY_ADMIN_ACCESS_TOKEN
+ *   SHOPIFY_SHOP_DOMAIN
  */
 
 import express from "express";
 import crypto from "crypto";
 
 const app = express();
-app.disable("x-powered-by");
-app.set("trust proxy", 1);
 
-const PORT = process.env.PORT || 3000;
-const SHOPIFY_API_SECRET = process.env.SHOPIFY_API_SECRET || "";
-const ALLOW_DIRECT = String(process.env.ALLOW_DIRECT || "").toLowerCase() === "true";
+const {
+  SHOPIFY_API_SECRET,
+  SHOPIFY_ADMIN_ACCESS_TOKEN,
+  SHOPIFY_SHOP_DOMAIN,
+  PORT,
+  RENDER_GIT_COMMIT,
+  NODE_ENV,
+} = process.env;
 
-// ====== EDIT THIS LIST ======
-const CARE_GUIDES = [
-  {
-    title: "Dracula Orchids — Care Guide",
-    url: "https://belgraveorchids.com.au/blogs/care-guides/dracula-orchids-care-guide",
-    note: "Cool-growing, high humidity, low heat tolerance",
-  },
-];
+const VERSION = "2.0.0";
 
-// ---- helpers ----
-function esc(s = "") {
-  return String(s)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
+// --- basic sanity checks (don’t crash, but warn loudly)
+function envOk() {
+  return Boolean(SHOPIFY_API_SECRET && SHOPIFY_ADMIN_ACCESS_TOKEN && SHOPIFY_SHOP_DOMAIN);
 }
 
-function timingSafeEqual(a, b) {
-  const ab = Buffer.from(a, "utf8");
-  const bb = Buffer.from(b, "utf8");
-  if (ab.length !== bb.length) return false;
-  return crypto.timingSafeEqual(ab, bb);
+function nowIso() {
+  return new Date().toISOString();
 }
 
-/**
- * Shopify App Proxy signature verification
- *
- * Shopify sends query params including `signature`.
- * To verify:
- * 1) Remove `signature`
- * 2) Sort params by key (lexicographic)
- * 3) Build message: key=value pairs concatenated with no separators? -> Shopify app proxy uses:
- *    message = key=value for each sorted key, joined with nothing? (common legacy)
- * In practice, Shopify expects: key=value&key2=value2... then HMAC-SHA256 secret, compare to signature.
- *
- * We'll do the robust approach used widely:
- * - Build querystring with & between pairs (after sorting)
- * - Use HMAC-SHA256 with SHOPIFY_API_SECRET
- * - Compare hex digest to provided signature
- */
-function verifyAppProxy(req) {
-  const q = { ...req.query };
+// Shopify proxy signature verification
+// Docs concept: signature = HMAC-SHA256(secret, sorted_querystring_without_signature)
+// NOTE: App Proxy signature is different to OAuth "hmac". This is the proxy "signature" parameter.
+function verifyShopifyProxySignature(query, secret) {
+  const { signature, ...rest } = query || {};
+  if (!signature) return { ok: false, reason: "Missing signature" };
 
-  const provided = (q.signature || "").toString();
-  if (!provided) {
-    return { ok: false, error: "Missing signature" };
-  }
-  if (!SHOPIFY_API_SECRET) {
-    return { ok: false, error: "Server missing SHOPIFY_API_SECRET" };
-  }
-
-  delete q.signature;
-
-  // Shopify may include arrays; normalize to strings
-  const keys = Object.keys(q).sort();
-  const pairs = keys.map((k) => {
-    const v = Array.isArray(q[k]) ? q[k].join(",") : String(q[k]);
-    return `${k}=${v}`;
-  });
-
-  const message = pairs.join("&");
+  // Shopify expects:
+  // - all query params except signature
+  // - sorted lexicographically by key
+  // - encoded as key=value pairs joined by &
+  // - then HMAC SHA256 using shared secret
+  const message = Object.keys(rest)
+    .sort()
+    .map((key) => `${key}=${Array.isArray(rest[key]) ? rest[key].join(",") : rest[key]}`)
+    .join("&");
 
   const digest = crypto
-    .createHmac("sha256", SHOPIFY_API_SECRET)
+    .createHmac("sha256", secret)
     .update(message)
     .digest("hex");
 
-  // Shopify signature is hex
-  const ok = timingSafeEqual(digest, provided);
-  return ok ? { ok: true } : { ok: false, error: "Invalid signature" };
+  const safeEqual =
+    digest.length === String(signature).length &&
+    crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(String(signature)));
+
+  return safeEqual
+    ? { ok: true }
+    : { ok: false, reason: "Invalid signature" };
 }
 
-/**
- * Determine whether this request is coming via Shopify proxy.
- * Shopify proxy requests include at least: shop, path_prefix, timestamp, signature (and sometimes logged_in_customer_id).
- */
-function looksLikeShopifyProxy(req) {
-  return Boolean(req.query && req.query.signature && req.query.shop);
+function hasProxySignature(query) {
+  return Boolean(query && query.signature);
 }
 
-function renderPage({ title, intro, items }) {
-  const now = new Date().toISOString();
-  const list = items
-    .map(
-      (g) => `
-      <li class="card">
-        <a class="title" href="${esc(g.url)}">${esc(g.title)}</a>
-        ${g.note ? `<div class="note">${esc(g.note)}</div>` : ""}
-        <div class="meta">${esc(g.url)}</div>
-      </li>
-    `
-    )
-    .join("");
-
-  return `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>${esc(title)}</title>
-  <meta name="robots" content="noindex,nofollow"/>
-  <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; background:#fff; color:#111; }
-    .wrap { max-width: 920px; margin: 0 auto; padding: 40px 20px; }
-    h1 { font-size: 40px; margin: 0 0 8px; }
-    p { margin: 0 0 18px; line-height: 1.5; color: #333; }
-    .small { font-size: 12px; color: #666; margin-top: 10px; }
-    .grid { list-style: none; padding: 0; margin: 18px 0 0; display: grid; grid-template-columns: 1fr; gap: 12px; }
-    @media (min-width: 720px) { .grid { grid-template-columns: 1fr 1fr; } }
-    .card { border: 1px solid #e5e5e5; border-radius: 14px; padding: 14px; }
-    .title { font-weight: 700; font-size: 16px; color: #111; text-decoration: none; }
-    .title:hover { text-decoration: underline; }
-    .note { margin-top: 8px; color:#333; font-size: 13px; line-height: 1.4; }
-    .meta { margin-top: 10px; font-size: 12px; color: #777; word-break: break-all; }
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <h1>${esc(title)}</h1>
-    <p>${esc(intro)}</p>
-    <ul class="grid">${list || `<li class="card">No guides yet.</li>`}</ul>
-    <p class="small">Updated: ${esc(now)}</p>
-  </div>
-</body>
-</html>`;
+// Simple allow-list for shop param (optional)
+function isExpectedShop(queryShop) {
+  if (!queryShop) return true; // some requests won’t include it
+  const expected = SHOPIFY_SHOP_DOMAIN.replace(/^https?:\/\//, "").toLowerCase();
+  const incoming = String(queryShop).replace(/^https?:\/\//, "").toLowerCase();
+  return incoming === expected;
 }
 
-// Health page
-app.get("/", (req, res) => {
-  res.status(200).send(`<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Care Guides Proxy</title></head>
-<body style="font-family:system-ui; padding:24px">
-<h1>Care Guides Proxy</h1>
-<p>Status: OK</p>
-<ul>
-  <li>Proxy endpoint: <code>/care-guides</code></li>
-  <li>Time: <code>${new Date().toISOString()}</code></li>
-</ul>
-</body></html>`);
-});
+// Shopify Admin API call helper (GraphQL)
+async function shopifyGraphQL(query, variables = {}) {
+  const shop = SHOPIFY_SHOP_DOMAIN.replace(/^https?:\/\//, "");
+  const url = `https://${shop}/admin/api/2025-01/graphql.json`;
 
-// Middleware to enforce Shopify signature on proxy endpoints
-function requireShopifySignature(req, res, next) {
-  // If it looks like a Shopify proxy request, enforce verification.
-  if (looksLikeShopifyProxy(req)) {
-    const check = verifyAppProxy(req);
-    if (!check.ok) {
-      return res.status(401).json({ ok: false, error: "Unauthorized", detail: check.error });
-    }
-    return next();
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Shopify-Access-Token": SHOPIFY_ADMIN_ACCESS_TOKEN,
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+
+  const text = await res.text();
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    throw new Error(`Shopify GraphQL non-JSON response (${res.status}): ${text.slice(0, 200)}`);
   }
 
-  // Otherwise it's a direct hit (browser/testing). Allow only if explicitly enabled.
-  if (ALLOW_DIRECT) return next();
-
-  return res.status(401).json({
-    ok: false,
-    error: "Unauthorized",
-    detail: "Direct access disabled (set ALLOW_DIRECT=true to test without Shopify signature)",
-  });
+  if (!res.ok) {
+    throw new Error(`Shopify GraphQL HTTP ${res.status}: ${JSON.stringify(json).slice(0, 200)}`);
+  }
+  if (json.errors?.length) {
+    throw new Error(`Shopify GraphQL errors: ${JSON.stringify(json.errors).slice(0, 300)}`);
+  }
+  return json.data;
 }
 
-// Shopify proxy page
-app.get("/care-guides", requireShopifySignature, (req, res) => {
-  res.status(200).set("Content-Type", "text/html; charset=utf-8").send(
-    renderPage({
-      title: "Care Guides",
-      intro:
-        "Start here. These guides are written for cool-growing orchids and long-term success — not quick fixes.",
-      items: CARE_GUIDES,
-    })
-  );
+// --- routes
+
+app.get("/", (req, res) => {
+  res
+    .status(200)
+    .type("text/plain")
+    .send(
+      [
+        `Care Guides Proxy – Status OK`,
+        `Version: ${VERSION}`,
+        `Env OK: ${envOk() ? "yes" : "NO (missing env vars)"}`,
+        `Time: ${nowIso()}`,
+        `Node env: ${NODE_ENV || "unknown"}`,
+      ].join("\n")
+    );
 });
 
-// JSON endpoint (also signed via proxy)
-app.get("/care-guides.json", requireShopifySignature, (req, res) => {
-  res.status(200).json({
-    ok: true,
-    count: CARE_GUIDES.length,
-    guides: CARE_GUIDES,
-    time: new Date().toISOString(),
+app.get("/healthz", (req, res) => {
+  res.status(envOk() ? 200 : 500).json({
+    ok: envOk(),
+    version: VERSION,
+    commit: RENDER_GIT_COMMIT || null,
+    time: nowIso(),
   });
 });
 
-app.use((req, res) => {
-  res.status(404).json({ ok: false, error: "Not found", path: req.path });
+/**
+ * Main App Proxy endpoint:
+ * Shopify → /apps/care-guides → Render → GET /care-guides
+ *
+ * Dual mode:
+ * - If signature present: must validate
+ * - If no signature: allow (public subdomain / direct)
+ */
+app.get("/care-guides", async (req, res) => {
+  try {
+    // Optional hard guard: ensure env is present
+    if (!envOk()) {
+      return res.status(500).json({
+        ok: false,
+        error: "Server not configured",
+        detail: "Missing required environment variables",
+      });
+    }
+
+    // Optional sanity check: shop param if present
+    if (!isExpectedShop(req.query.shop)) {
+      return res.status(401).json({
+        ok: false,
+        error: "Unauthorized",
+        detail: "Unexpected shop value",
+      });
+    }
+
+    // Verify signature only if present
+    if (hasProxySignature(req.query)) {
+      const verified = verifyShopifyProxySignature(req.query, SHOPIFY_API_SECRET);
+      if (!verified.ok) {
+        return res.status(401).json({
+          ok: false,
+          error: "Unauthorized",
+          detail: verified.reason,
+        });
+      }
+    }
+
+    // --- TODO: Replace this placeholder with your real logic
+    // Inputs you may use later:
+    // const { order, email } = req.query;
+    //
+    // For now, return a stable “proxy works” response:
+    // (keeps your previous milestone behaviour)
+    const payload = {
+      ok: true,
+      guides: [],
+      meta: {
+        signed: hasProxySignature(req.query),
+        shop: req.query.shop || null,
+        path_prefix: req.query.path_prefix || null,
+        timestamp: req.query.timestamp || null,
+      },
+    };
+
+    // OPTIONAL: If you want to prove Admin API access works, uncomment:
+    /*
+    const data = await shopifyGraphQL(`
+      query ShopName {
+        shop { name myshopifyDomain }
+      }
+    `);
+    payload.meta.shopify = data.shop;
+    */
+
+    return res.status(200).json(payload);
+  } catch (err) {
+    console.error("[/care-guides] error:", err);
+    return res.status(500).json({
+      ok: false,
+      error: "Server error",
+      detail: err?.message || String(err),
+    });
+  }
 });
 
-app.listen(PORT, () => {
-  console.log(`Care Guides Proxy listening on port ${PORT}`);
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ ok: false, error: "Not found" });
+});
+
+const port = Number(PORT) || 3000;
+app.listen(port, () => {
+  console.log(`[Care Guides Proxy] v${VERSION} listening on ${port}`);
 });

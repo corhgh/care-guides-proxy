@@ -1,17 +1,20 @@
 /**
- * Care Guides Proxy (v2.1-no-token)
- * - NO Admin API token
- * - NO Storefront token
- * - Works via Shopify App Proxy + optional public subdomain
+ * Care Guides Proxy (v2.1.1-no-token)
+ * - NO Admin token, NO Storefront token
+ * - Shopify App Proxy signature verification when present (dual-mode)
+ * - Works even if Shopify App Proxy target points to "/" (root fallback)
+ *
+ * Endpoints:
+ *   GET /                 -> status page (unless guides params exist)
+ *   GET /healthz          -> json health
+ *   GET /care-guides      -> json response with guide URLs
  *
  * Input:
- *   /care-guides?guides=https://... ,https://...
- *   OR
- *   /care-guides?guide=https://...&guide=https://...
+ *   /care-guides?guides=url1,url2
+ *   /care-guides?guide=url1&guide=url2
  *
- * Dual-mode:
- *   - If Shopify proxy signature exists -> verify
- *   - If no signature -> allow
+ * Root fallback:
+ *   /?guides=... behaves the same as /care-guides?guides=...
  */
 
 import express from "express";
@@ -19,8 +22,13 @@ import crypto from "crypto";
 
 const app = express();
 
-const { SHOPIFY_API_SECRET, PORT, NODE_ENV, RENDER_GIT_COMMIT } = process.env;
-const VERSION = "2.1.0-no-token";
+const VERSION = "2.1.1-no-token";
+
+// Accept either env var name to avoid mismatch issues
+const SHOPIFY_API_SECRET =
+  process.env.SHOPIFY_API_SECRET || process.env.SHOPIFY_APP_PROXY_SECRET;
+
+const { PORT, NODE_ENV, RENDER_GIT_COMMIT } = process.env;
 
 function envOk() {
   return Boolean(SHOPIFY_API_SECRET);
@@ -48,7 +56,8 @@ function verifyShopifyProxySignature(query, secret) {
 
   const sig = String(signature);
   const safeEqual =
-    digest.length === sig.length && crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(sig));
+    digest.length === sig.length &&
+    crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(sig));
 
   return safeEqual ? { ok: true } : { ok: false, reason: "Invalid signature" };
 }
@@ -73,13 +82,12 @@ function parseGuides(req) {
     else list.push(String(g).trim());
   }
 
-  // Basic clean + dedupe
+  // Clean + dedupe + only http(s)
   const seen = new Set();
   const out = [];
   for (const u of list) {
     const url = String(u || "").trim();
     if (!url) continue;
-    // allow only http(s)
     if (!/^https?:\/\//i.test(url)) continue;
     if (seen.has(url)) continue;
     seen.add(url);
@@ -89,7 +97,46 @@ function parseGuides(req) {
   return out.slice(0, 50); // safety cap
 }
 
+function handleCareGuides(req, res) {
+  if (!envOk()) {
+    return res.status(500).json({
+      ok: false,
+      error: "Server not configured",
+      detail: "Missing SHOPIFY_API_SECRET",
+    });
+  }
+
+  // Verify signature only if present (dual-mode)
+  if (hasProxySignature(req.query)) {
+    const verified = verifyShopifyProxySignature(req.query, SHOPIFY_API_SECRET);
+    if (!verified.ok) {
+      return res.status(401).json({
+        ok: false,
+        error: "Unauthorized",
+        detail: verified.reason,
+      });
+    }
+  }
+
+  const guides = parseGuides(req);
+
+  return res.status(200).json({
+    ok: true,
+    guides,
+    meta: {
+      signed: hasProxySignature(req.query),
+      count: guides.length,
+    },
+  });
+}
+
+// Root: show status OR (if guides params exist) behave like /care-guides
 app.get("/", (req, res) => {
+  // ✅ Root fallback: if Shopify proxy incorrectly targets "/", still work.
+  if (req.query.guides || req.query.guide) {
+    return handleCareGuides(req, res);
+  }
+
   res.status(200).type("text/plain").send(
     [
       "Care Guides Proxy – Status OK",
@@ -111,40 +158,12 @@ app.get("/healthz", (req, res) => {
 });
 
 app.get("/care-guides", (req, res) => {
-  try {
-    if (!envOk()) {
-      return res.status(500).json({
-        ok: false,
-        error: "Server not configured",
-        detail: "Missing SHOPIFY_API_SECRET",
-      });
-    }
-
-    // Verify signature only if present (dual-mode)
-    if (hasProxySignature(req.query)) {
-      const verified = verifyShopifyProxySignature(req.query, SHOPIFY_API_SECRET);
-      if (!verified.ok) {
-        return res.status(401).json({ ok: false, error: "Unauthorized", detail: verified.reason });
-      }
-    }
-
-    const guides = parseGuides(req);
-
-    return res.status(200).json({
-      ok: true,
-      guides,
-      meta: {
-        signed: hasProxySignature(req.query),
-        count: guides.length,
-      },
-    });
-  } catch (err) {
-    console.error("[/care-guides] error:", err);
-    return res.status(500).json({ ok: false, error: "Server error", detail: err?.message || String(err) });
-  }
+  return handleCareGuides(req, res);
 });
 
 app.use((req, res) => res.status(404).json({ ok: false, error: "Not found" }));
 
 const port = Number(PORT) || 3000;
-app.listen(port, () => console.log(`[Care Guides Proxy] ${VERSION} listening on ${port}`));
+app.listen(port, () => {
+  console.log(`[Care Guides Proxy] ${VERSION} listening on ${port}`);
+});

@@ -1,19 +1,17 @@
 /**
- * Belgrave Orchids — Care Guides Proxy (v2.1)
- * Storefront-token based (NO shpat required)
+ * Care Guides Proxy (v2.1-no-token)
+ * - NO Admin API token
+ * - NO Storefront token
+ * - Works via Shopify App Proxy + optional public subdomain
  *
- * Endpoints:
- *   GET /                 -> status
- *   GET /healthz          -> json health
- *   GET /care-guides      -> returns care guide URLs for product handles or ids
+ * Input:
+ *   /care-guides?guides=https://... ,https://...
+ *   OR
+ *   /care-guides?guide=https://...&guide=https://...
  *
- * Query params supported:
- *   handles=handle-a,handle-b
- *   ids=gid://shopify/Product/123,gid://shopify/Product/456
- *
- * Dual-mode access:
- *   - If Shopify proxy signature is present -> verify
- *   - If no signature -> allow (subdomain access)
+ * Dual-mode:
+ *   - If Shopify proxy signature exists -> verify
+ *   - If no signature -> allow
  */
 
 import express from "express";
@@ -21,21 +19,11 @@ import crypto from "crypto";
 
 const app = express();
 
-const {
-  SHOPIFY_API_SECRET, // Dev Dashboard app secret (for proxy signature verification)
-  SHOPIFY_SHOP_DOMAIN, // belgraveorchids.com.au (or belgraveorchids.myshopify.com)
-  SHOPIFY_STOREFRONT_ACCESS_TOKEN, // Storefront API token
-  SHOPIFY_STOREFRONT_API_VERSION, // optional override (default below)
-  PORT,
-  NODE_ENV,
-  RENDER_GIT_COMMIT,
-} = process.env;
-
-const VERSION = "2.1.0";
-const STOREFRONT_VERSION = SHOPIFY_STOREFRONT_API_VERSION || "2025-01";
+const { SHOPIFY_API_SECRET, PORT, NODE_ENV, RENDER_GIT_COMMIT } = process.env;
+const VERSION = "2.1.0-no-token";
 
 function envOk() {
-  return Boolean(SHOPIFY_API_SECRET && SHOPIFY_SHOP_DOMAIN && SHOPIFY_STOREFRONT_ACCESS_TOKEN);
+  return Boolean(SHOPIFY_API_SECRET);
 }
 
 function nowIso() {
@@ -46,6 +34,7 @@ function hasProxySignature(query) {
   return Boolean(query && query.signature);
 }
 
+// Shopify App Proxy signature verification (signature param)
 function verifyShopifyProxySignature(query, secret) {
   const { signature, ...rest } = query || {};
   if (!signature) return { ok: false, reason: "Missing signature" };
@@ -64,66 +53,50 @@ function verifyShopifyProxySignature(query, secret) {
   return safeEqual ? { ok: true } : { ok: false, reason: "Invalid signature" };
 }
 
-function normaliseShopDomain(domain) {
-  // Storefront endpoint expects the myshopify domain.
-  // If you pass belgraveorchids.com.au, we can’t safely derive myshopify automatically.
-  // So: prefer setting SHOPIFY_SHOP_DOMAIN to belgraveorchids.myshopify.com
-  return String(domain || "").replace(/^https?:\/\//, "").trim();
-}
+function parseGuides(req) {
+  // supports:
+  // - ?guides=url1,url2
+  // - ?guide=url1&guide=url2
+  const list = [];
 
-async function storefrontGraphQL(query, variables = {}) {
-  const shop = normaliseShopDomain(SHOPIFY_SHOP_DOMAIN);
-
-  // IMPORTANT:
-  // Storefront API endpoint uses the shop's *myshopify* domain.
-  // If SHOPIFY_SHOP_DOMAIN is belgraveorchids.com.au, this will fail.
-  const url = `https://${shop}/api/${STOREFRONT_VERSION}/graphql.json`;
-
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Shopify-Storefront-Access-Token": SHOPIFY_STOREFRONT_ACCESS_TOKEN,
-    },
-    body: JSON.stringify({ query, variables }),
-  });
-
-  const text = await res.text();
-  let json;
-  try {
-    json = JSON.parse(text);
-  } catch {
-    throw new Error(`Storefront non-JSON response (${res.status}): ${text.slice(0, 200)}`);
+  if (req.query.guides) {
+    String(req.query.guides)
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .forEach((u) => list.push(u));
   }
 
-  if (!res.ok) {
-    throw new Error(`Storefront HTTP ${res.status}: ${JSON.stringify(json).slice(0, 200)}`);
+  const g = req.query.guide;
+  if (g) {
+    if (Array.isArray(g)) g.forEach((u) => list.push(String(u).trim()));
+    else list.push(String(g).trim());
   }
-  if (json.errors?.length) {
-    throw new Error(`Storefront errors: ${JSON.stringify(json.errors).slice(0, 300)}`);
+
+  // Basic clean + dedupe
+  const seen = new Set();
+  const out = [];
+  for (const u of list) {
+    const url = String(u || "").trim();
+    if (!url) continue;
+    // allow only http(s)
+    if (!/^https?:\/\//i.test(url)) continue;
+    if (seen.has(url)) continue;
+    seen.add(url);
+    out.push(url);
   }
-  return json.data;
-}
 
-function parseCsvParam(value) {
-  if (!value) return [];
-  return String(value)
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
+  return out.slice(0, 50); // safety cap
 }
-
-// --- Routes
 
 app.get("/", (req, res) => {
   res.status(200).type("text/plain").send(
     [
-      `Care Guides Proxy – Status OK`,
+      "Care Guides Proxy – Status OK",
       `Version: ${VERSION}`,
-      `Env OK: ${envOk() ? "yes" : "NO (missing env vars)"}`,
+      `Env OK: ${envOk() ? "yes" : "NO (missing SHOPIFY_API_SECRET)"}`,
       `Time: ${nowIso()}`,
       `Node env: ${NODE_ENV || "unknown"}`,
-      `Storefront API: ${STOREFRONT_VERSION}`,
     ].join("\n")
   );
 });
@@ -132,32 +105,18 @@ app.get("/healthz", (req, res) => {
   res.status(envOk() ? 200 : 500).json({
     ok: envOk(),
     version: VERSION,
-    storefrontApiVersion: STOREFRONT_VERSION,
     commit: RENDER_GIT_COMMIT || null,
     time: nowIso(),
   });
 });
 
-/**
- * GET /care-guides
- * Supports:
- *   ?handles=a,b,c
- *   ?ids=gid://shopify/Product/...,gid://shopify/Product/...
- *
- * Returns:
- *   {
- *     ok: true,
- *     guides: [{ handle, title, care_guide_url }],
- *     unique_urls: [...]
- *   }
- */
-app.get("/care-guides", async (req, res) => {
+app.get("/care-guides", (req, res) => {
   try {
     if (!envOk()) {
       return res.status(500).json({
         ok: false,
         error: "Server not configured",
-        detail: "Missing SHOPIFY_API_SECRET / SHOPIFY_SHOP_DOMAIN / SHOPIFY_STOREFRONT_ACCESS_TOKEN",
+        detail: "Missing SHOPIFY_API_SECRET",
       });
     }
 
@@ -169,117 +128,23 @@ app.get("/care-guides", async (req, res) => {
       }
     }
 
-    const handles = parseCsvParam(req.query.handles);
-    const ids = parseCsvParam(req.query.ids);
-
-    if (handles.length === 0 && ids.length === 0) {
-      return res.status(400).json({
-        ok: false,
-        error: "Missing input",
-        detail: "Provide ?handles=handle-a,handle-b OR ?ids=gid://shopify/Product/...",
-        example: "/care-guides?handles=dracula-vampira,masdevallia-xyz",
-      });
-    }
-
-    // Storefront: easiest is by handle (productByHandle).
-    // For ids, use nodes(ids: [...]).
-
-    const results = [];
-
-    if (handles.length) {
-      // Fetch sequentially to keep it simple + stable (handles list will be small).
-      for (const handle of handles.slice(0, 25)) {
-        const data = await storefrontGraphQL(
-          `
-          query ProductCareGuideByHandle($handle: String!) {
-            productByHandle(handle: $handle) {
-              id
-              title
-              handle
-              metafield(namespace: "custom", key: "care_guide") { value }
-            }
-          }
-        `,
-          { handle }
-        );
-
-        const p = data?.productByHandle;
-        if (!p) continue;
-
-        results.push({
-          id: p.id,
-          handle: p.handle,
-          title: p.title,
-          care_guide_url: p.metafield?.value || null,
-        });
-      }
-    }
-
-    if (ids.length) {
-      const data = await storefrontGraphQL(
-        `
-        query ProductsCareGuideByIds($ids: [ID!]!) {
-          nodes(ids: $ids) {
-            __typename
-            ... on Product {
-              id
-              title
-              handle
-              metafield(namespace: "custom", key: "care_guide") { value }
-            }
-          }
-        }
-      `,
-        { ids: ids.slice(0, 50) }
-      );
-
-      const nodes = data?.nodes || [];
-      for (const n of nodes) {
-        if (!n || n.__typename !== "Product") continue;
-        results.push({
-          id: n.id,
-          handle: n.handle,
-          title: n.title,
-          care_guide_url: n.metafield?.value || null,
-        });
-      }
-    }
-
-    // Dedupe + clean URLs
-    const unique = [];
-    const seen = new Set();
-    for (const r of results) {
-      const url = r.care_guide_url ? String(r.care_guide_url).trim() : null;
-      if (url && !seen.has(url)) {
-        seen.add(url);
-        unique.push(url);
-      }
-      r.care_guide_url = url;
-    }
+    const guides = parseGuides(req);
 
     return res.status(200).json({
       ok: true,
-      guides: results,
-      unique_urls: unique,
+      guides,
       meta: {
         signed: hasProxySignature(req.query),
-        handles_count: handles.length,
-        ids_count: ids.length,
+        count: guides.length,
       },
     });
   } catch (err) {
     console.error("[/care-guides] error:", err);
-    return res.status(500).json({
-      ok: false,
-      error: "Server error",
-      detail: err?.message || String(err),
-      hint:
-        "If Storefront endpoint fails, ensure SHOPIFY_SHOP_DOMAIN is your *.myshopify.com domain for Storefront API.",
-    });
+    return res.status(500).json({ ok: false, error: "Server error", detail: err?.message || String(err) });
   }
 });
 
 app.use((req, res) => res.status(404).json({ ok: false, error: "Not found" }));
 
 const port = Number(PORT) || 3000;
-app.listen(port, () => console.log(`[Care Guides Proxy] v${VERSION} listening on ${port}`));
+app.listen(port, () => console.log(`[Care Guides Proxy] ${VERSION} listening on ${port}`));

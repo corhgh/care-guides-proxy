@@ -4,32 +4,62 @@ import crypto from "crypto";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const { SHOPIFY_APP_PROXY_SECRET } = process.env;
+/**
+ * Shopify App Proxy HMAC verification
+ */
+function verifyShopifyProxy(req) {
+  const query = { ...req.query };
+  const providedHmac = query.hmac;
 
-function verifyProxySignature(query, secret) {
-  const q = { ...query };
-  const signature = q.signature;
-  if (!signature || !secret) return false;
-  delete q.signature;
+  if (!providedHmac) return false;
 
-  const message = Object.keys(q)
+  delete query.hmac;
+  delete query.signature; // legacy safety
+
+  const message = Object.keys(query)
     .sort()
-    .map((k) => `${k}=${Array.isArray(q[k]) ? q[k].join(",") : q[k]}`)
-    .join("");
+    .map((key) => `${key}=${Array.isArray(query[key]) ? query[key].join(",") : query[key]}`)
+    .join("&");
 
-  const digest = crypto.createHmac("sha256", secret).update(message).digest("hex");
+  const generatedHmac = crypto
+    .createHmac("sha256", process.env.SHOPIFY_APP_SECRET)
+    .update(message)
+    .digest("hex");
 
-  if (signature.length !== digest.length) return false;
-  return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(digest));
+  return crypto.timingSafeEqual(
+    Buffer.from(generatedHmac),
+    Buffer.from(providedHmac)
+  );
 }
 
-app.get("/care-guides", (req, res) => {
-  if (!verifyProxySignature(req.query, SHOPIFY_APP_PROXY_SECRET)) {
-    return res.status(401).json({ ok: false, error: "Unauthorized" });
-  }
-
-  // Temporary response (we’ll wire Shopify Admin API next)
-  return res.json({ ok: true, guides: [] });
+/**
+ * Health check (NOT proxied)
+ */
+app.get("/", (req, res) => {
+  res.send("Care Guides Proxy running");
 });
 
-app.listen(PORT, () => console.log(`Running on ${PORT}`));
+/**
+ * App Proxy endpoint
+ * Shopify → /apps/care-guides → Render
+ */
+app.get("/care-guides", (req, res) => {
+  if (!verifyShopifyProxy(req)) {
+    return res.status(401).json({
+      ok: false,
+      error: "Unauthorized",
+    });
+  }
+
+  /**
+   * Replace this with real data later
+   */
+  res.json({
+    ok: true,
+    guides: [],
+  });
+});
+
+app.listen(PORT, () => {
+  console.log(`Care Guides Proxy listening on ${PORT}`);
+});

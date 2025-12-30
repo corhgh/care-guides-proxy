@@ -1,26 +1,30 @@
 /**
- * Care Guides Proxy (v2.2.1)
- * - Smart landing page (HTML) by default
- * - JSON available via ?format=json
- * - Root fallback if Shopify App Proxy points to "/"
- * - Dual-mode Shopify proxy signature verification
- * - NO Admin API token
- * - NO Storefront token
+ * Care Guides Proxy (v2.2.2)
+ *
+ * ✔ Smart HTML landing page (default)
+ * ✔ JSON via ?format=json
+ * ✔ ROOT fallback if Shopify proxy points to "/"
+ * ✔ CORRECT Shopify App Proxy signature verification
+ * ✔ Supports full URLs in query params
+ * ✔ NO Admin API token
+ * ✔ NO Storefront token
  */
 
 import express from "express";
 import crypto from "crypto";
 
 const app = express();
-const VERSION = "2.2.1";
+const VERSION = "2.2.2";
 
-// Accept either env var name (never break again)
+// Accept either env var name
 const SHOPIFY_API_SECRET =
   process.env.SHOPIFY_API_SECRET || process.env.SHOPIFY_APP_PROXY_SECRET;
 
 const { PORT, NODE_ENV, RENDER_GIT_COMMIT } = process.env;
 
-/* -------------------- helpers -------------------- */
+/* -------------------------------------------------- */
+/* Helpers                                            */
+/* -------------------------------------------------- */
 
 function envOk() {
   return Boolean(SHOPIFY_API_SECRET);
@@ -34,16 +38,49 @@ function hasProxySignature(query) {
   return Boolean(query && query.signature);
 }
 
-function verifyShopifyProxySignature(query, secret) {
-  const { signature, ...rest } = query || {};
+/**
+ * CRITICAL:
+ * Shopify App Proxy signs the RAW query string.
+ * We must verify against req.originalUrl (not req.query).
+ */
+function verifyShopifyProxySignatureFromReq(req, secret) {
+  const originalUrl = req.originalUrl || "";
+  const qIndex = originalUrl.indexOf("?");
+
+  if (qIndex === -1) return { ok: false, reason: "Missing signature" };
+
+  const rawQuery = originalUrl.slice(qIndex + 1);
+  const parts = rawQuery.split("&").filter(Boolean);
+
+  let signature = null;
+  const unsignedParts = [];
+
+  for (const part of parts) {
+    const eq = part.indexOf("=");
+    const key = eq === -1 ? part : part.slice(0, eq);
+
+    if (key === "signature") {
+      signature = eq === -1 ? "" : part.slice(eq + 1);
+      continue;
+    }
+    unsignedParts.push(part); // keep RAW key=value
+  }
+
   if (!signature) return { ok: false, reason: "Missing signature" };
 
-  const message = Object.keys(rest)
-    .sort()
-    .map((key) => `${key}=${Array.isArray(rest[key]) ? rest[key].join(",") : rest[key]}`)
-    .join("&");
+  unsignedParts.sort((a, b) => {
+    const ak = a.split("=", 1)[0];
+    const bk = b.split("=", 1)[0];
+    return ak < bk ? -1 : ak > bk ? 1 : 0;
+  });
 
-  const digest = crypto.createHmac("sha256", secret).update(message).digest("hex");
+  const message = unsignedParts.join("&");
+
+  const digest = crypto
+    .createHmac("sha256", secret)
+    .update(message)
+    .digest("hex");
+
   const sig = String(signature);
 
   const safeEqual =
@@ -117,16 +154,15 @@ function titleFromUrl(url) {
 
 function renderHtml({ guides, signed }) {
   const items = guides
-    .map((url) => {
-      const title = titleFromUrl(url);
-      return `
-        <li>
-          <a href="${escapeHtml(url)}" target="_blank" rel="noopener">
-            ${escapeHtml(title)}
-          </a>
-          <div class="url">${escapeHtml(url)}</div>
-        </li>`;
-    })
+    .map(
+      (url) => `
+      <li>
+        <a href="${escapeHtml(url)}" target="_blank" rel="noopener">
+          ${escapeHtml(titleFromUrl(url))}
+        </a>
+        <div class="url">${escapeHtml(url)}</div>
+      </li>`
+    )
     .join("");
 
   return `<!doctype html>
@@ -137,61 +173,18 @@ function renderHtml({ guides, signed }) {
 <title>Your Care Guides — Belgrave Orchids</title>
 <meta name="robots" content="noindex,nofollow">
 <style>
-  body {
-    margin:0;
-    font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
-    background:#fafafa;
-    color:#111;
-  }
-  .wrap {
-    max-width:860px;
-    margin:0 auto;
-    padding:32px 16px 56px;
-  }
-  .card {
-    background:#fff;
-    border:1px solid #e6e6e6;
-    border-radius:14px;
-    padding:20px;
-  }
-  h1 {
-    margin:0 0 10px;
-    font-size:22px;
-  }
-  p {
-    margin:0 0 16px;
-    color:#555;
-  }
-  ul {
-    list-style:none;
-    padding:0;
-    margin:0;
-  }
-  li {
-    padding:12px 0;
-    border-top:1px solid #eee;
-  }
+  body { margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial; background:#fafafa; color:#111; }
+  .wrap { max-width:860px; margin:0 auto; padding:32px 16px 56px; }
+  .card { background:#fff; border:1px solid #e6e6e6; border-radius:14px; padding:20px; }
+  h1 { margin:0 0 10px; font-size:22px; }
+  p { margin:0 0 16px; color:#555; }
+  ul { list-style:none; padding:0; margin:0; }
+  li { padding:12px 0; border-top:1px solid #eee; }
   li:first-child { border-top:0; }
-  a {
-    font-weight:600;
-    color:#111;
-    text-decoration:none;
-  }
+  a { font-weight:600; color:#111; text-decoration:none; }
   a:hover { text-decoration:underline; }
-  .url {
-    margin-top:6px;
-    font-size:12px;
-    color:#777;
-    word-break:break-all;
-  }
-  .meta {
-    margin-top:16px;
-    font-size:12px;
-    color:#777;
-    display:flex;
-    justify-content:space-between;
-    flex-wrap:wrap;
-  }
+  .url { margin-top:6px; font-size:12px; color:#777; word-break:break-all; }
+  .meta { margin-top:16px; font-size:12px; color:#777; display:flex; justify-content:space-between; flex-wrap:wrap; }
 </style>
 </head>
 <body>
@@ -199,9 +192,7 @@ function renderHtml({ guides, signed }) {
   <div class="card">
     <h1>Your care guides</h1>
     <p>These guides are matched to the plants in your order. Save this page for reference.</p>
-
-    ${guides.length ? `<ul>${items}</ul>` : `<p>No care guides were found for this order.</p>`}
-
+    ${guides.length ? `<ul>${items}</ul>` : `<p>No care guides were found.</p>`}
     <div class="meta">
       <div>Belgrave Orchids</div>
       <div>${signed ? "Verified via Shopify" : "Public link"}</div>
@@ -212,7 +203,9 @@ function renderHtml({ guides, signed }) {
 </html>`;
 }
 
-/* -------------------- core handler -------------------- */
+/* -------------------------------------------------- */
+/* Core handler                                       */
+/* -------------------------------------------------- */
 
 function handleCareGuides(req, res) {
   if (!envOk()) {
@@ -226,7 +219,7 @@ function handleCareGuides(req, res) {
   let signed = false;
   if (hasProxySignature(req.query)) {
     signed = true;
-    const verified = verifyShopifyProxySignature(req.query, SHOPIFY_API_SECRET);
+    const verified = verifyShopifyProxySignatureFromReq(req, SHOPIFY_API_SECRET);
     if (!verified.ok) {
       return res.status(401).json({
         ok: false,
@@ -249,10 +242,12 @@ function handleCareGuides(req, res) {
   return res.status(200).type("text/html").send(renderHtml({ guides, signed }));
 }
 
-/* -------------------- routes -------------------- */
+/* -------------------------------------------------- */
+/* Routes                                             */
+/* -------------------------------------------------- */
 
 app.get("/", (req, res) => {
-  // Root fallback: if Shopify proxy points here, still serve guides
+  // Root fallback for mis-pointed App Proxy
   if (req.query.guides || req.query.guide) {
     return handleCareGuides(req, res);
   }

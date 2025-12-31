@@ -1,195 +1,164 @@
 /**
- * Care Guides Proxy (v2.3.0)
+ * Belgrave Orchids — Care Guides Proxy (Render)
+ * Phase 1: Public endpoint that returns guide URLs from either:
+ *   - ?guides=URL,URL
+ *   - ?order=####  (returns [] for now; Phase 2 will map order -> products -> metafield URLs)
  *
- * ✔ Smart HTML landing page (default)
- * ✔ JSON via ?format=json
- * ✔ ROOT fallback if Shopify proxy points to "/"
- * ✔ NO Shopify signature enforcement (intentional)
- * ✔ Supports full URLs in query params
- * ✔ NO Admin API token
- * ✔ NO Storefront token
+ * IMPORTANT: This service is called directly from the browser on belgraveorchids.com.au
+ * so it MUST send proper CORS headers.
  */
 
 import express from "express";
+import helmet from "helmet";
 
 const app = express();
-const VERSION = "2.3.0";
 
-const { PORT, NODE_ENV, RENDER_GIT_COMMIT } = process.env;
+// -------------------- Config --------------------
+const PORT = process.env.PORT || 3000;
 
-/* -------------------------------------------------- */
-/* Helpers                                            */
-/* -------------------------------------------------- */
+// Allow these origins to fetch from the browser.
+// You can add your staging domain here if needed.
+const ALLOWED_ORIGINS = new Set([
+  "https://belgraveorchids.com.au",
+  "https://www.belgraveorchids.com.au",
+  // Optional local dev:
+  "http://localhost:3000",
+  "http://localhost:5173",
+]);
 
-function nowIso() {
-  return new Date().toISOString();
-}
+// If you want to allow ANY origin (public endpoint), set this to true.
+// For your use-case, allowing all is acceptable because this endpoint is read-only.
+const ALLOW_ANY_ORIGIN = false;
 
-function parseGuides(req) {
-  const list = [];
+// -------------------- Middleware --------------------
+app.use(helmet());
 
-  if (req.query.guides) {
-    String(req.query.guides)
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean)
-      .forEach((u) => list.push(u));
+// CORS (must come before routes)
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+
+  if (ALLOW_ANY_ORIGIN) {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+  } else if (origin && ALLOWED_ORIGINS.has(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
   }
 
-  const g = req.query.guide;
-  if (g) {
-    if (Array.isArray(g)) g.forEach((u) => list.push(String(u).trim()));
-    else list.push(String(g).trim());
-  }
+  // Let browsers do preflight
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
-  const seen = new Set();
-  const out = [];
+  // If you ever use cookies/credentials, you'd need:
+  // res.setHeader("Access-Control-Allow-Credentials", "true");
 
-  for (const u of list) {
-    const url = String(u || "").trim();
-    if (!url) continue;
-    if (!/^https?:\/\//i.test(url)) continue;
-    if (seen.has(url)) continue;
-    seen.add(url);
-    out.push(url);
-  }
+  next();
+});
 
-  return out.slice(0, 50);
-}
+// Handle preflight OPTIONS for all routes
+app.options("*", (req, res) => {
+  return res.sendStatus(204);
+});
 
-function wantsJson(req) {
-  const f = String(req.query.format || "").toLowerCase();
-  if (f === "json") return true;
-  if (f === "html") return false;
+// Basic JSON parsing (not strictly needed for GET, but safe)
+app.use(express.json({ limit: "256kb" }));
 
-  const accept = String(req.headers.accept || "").toLowerCase();
-  return accept.includes("application/json") && !accept.includes("text/html");
-}
+// No caching (nice for debugging; change later if desired)
+app.use((req, res, next) => {
+  res.setHeader("Cache-Control", "no-store");
+  next();
+});
 
-function escapeHtml(s) {
-  return String(s)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
-}
-
-function titleFromUrl(url) {
+// -------------------- Helpers --------------------
+function isValidHttpUrl(u) {
   try {
-    const u = new URL(url);
-    const slug = u.pathname.split("/").filter(Boolean).pop();
-    if (!slug) return url;
-    const t = slug.replaceAll("-", " ");
-    return t.charAt(0).toUpperCase() + t.slice(1);
+    const url = new URL(u);
+    return url.protocol === "http:" || url.protocol === "https:";
   } catch {
-    return url;
+    return false;
   }
 }
 
-function renderHtml({ guides }) {
-  const items = guides
-    .map(
-      (url) => `
-      <li>
-        <a href="${escapeHtml(url)}" target="_blank" rel="noopener">
-          ${escapeHtml(titleFromUrl(url))}
-        </a>
-        <div class="url">${escapeHtml(url)}</div>
-      </li>`
-    )
-    .join("");
+function normalizeAndDedup(urls) {
+  const out = [];
+  const seen = new Set();
 
-  return `<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Your Care Guides — Belgrave Orchids</title>
-<meta name="robots" content="noindex,nofollow">
-<style>
-  body { margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial; background:#fafafa; color:#111; }
-  .wrap { max-width:860px; margin:0 auto; padding:32px 16px 56px; }
-  .card { background:#fff; border:1px solid #e6e6e6; border-radius:14px; padding:20px; }
-  h1 { margin:0 0 10px; font-size:22px; }
-  p { margin:0 0 16px; color:#555; }
-  ul { list-style:none; padding:0; margin:0; }
-  li { padding:12px 0; border-top:1px solid #eee; }
-  li:first-child { border-top:0; }
-  a { font-weight:600; color:#111; text-decoration:none; }
-  a:hover { text-decoration:underline; }
-  .url { margin-top:6px; font-size:12px; color:#777; word-break:break-all; }
-  .meta { margin-top:16px; font-size:12px; color:#777; display:flex; justify-content:space-between; flex-wrap:wrap; }
-</style>
-</head>
-<body>
-<div class="wrap">
-  <div class="card">
-    <h1>Your care guides</h1>
-    <p>These guides are matched to the plants in your order. Save this page for reference.</p>
-    ${guides.length ? `<ul>${items}</ul>` : `<p>No care guides were found.</p>`}
-    <div class="meta">
-      <div>Belgrave Orchids</div>
-      <div>Public link</div>
-    </div>
-  </div>
-</div>
-</body>
-</html>`;
+  for (const raw of urls) {
+    const u = String(raw || "").trim();
+    if (!u) continue;
+    if (!isValidHttpUrl(u)) continue;
+    if (seen.has(u)) continue;
+    seen.add(u);
+    out.push(u);
+  }
+  return out;
 }
 
-/* -------------------------------------------------- */
-/* Core handler                                       */
-/* -------------------------------------------------- */
+// -------------------- Routes --------------------
+app.get("/health", (req, res) => {
+  res.status(200).json({ ok: true });
+});
 
-function handleCareGuides(req, res) {
-  const guides = parseGuides(req);
+/**
+ * GET /care-guides
+ * - ?guides=URL,URL
+ * - ?order=1682&format=json
+ */
+app.get("/care-guides", async (req, res) => {
+  try {
+    const order = String(req.query.order || "").trim();
+    const guidesParam = String(req.query.guides || "").trim();
 
-  if (wantsJson(req)) {
-    return res.status(200).json({
-      ok: true,
-      guides,
-      meta: { count: guides.length },
+    // Mode A: explicit guides list
+    if (guidesParam) {
+      const guides = normalizeAndDedup(
+        guidesParam.split(",").map((s) => s.trim())
+      );
+
+      return res.status(200).json({
+        ok: true,
+        guides,
+        meta: {
+          mode: "guides",
+          count: guides.length,
+        },
+      });
+    }
+
+    // Mode B: order lookup (Phase 1 returns empty list)
+    if (order) {
+      // Phase 1: we don't map order -> line items -> metafields yet
+      // so return an empty list (your Shopify page will still render ALWAYS guide).
+      const guides = [];
+
+      return res.status(200).json({
+        ok: true,
+        guides,
+        meta: {
+          mode: "order",
+          order,
+          count: guides.length,
+          phase: 1,
+        },
+      });
+    }
+
+    // No valid input
+    return res.status(400).json({
+      ok: false,
+      error: "Missing query",
+      detail: "Provide either ?guides=URL,URL or ?order=####",
+    });
+  } catch (err) {
+    console.error("CARE-GUIDES ERROR:", err);
+    return res.status(500).json({
+      ok: false,
+      error: "Server error",
+      detail: "Unexpected error while building care guides response.",
     });
   }
-
-  return res.status(200).type("text/html").send(renderHtml({ guides }));
-}
-
-/* -------------------------------------------------- */
-/* Routes                                             */
-/* -------------------------------------------------- */
-
-app.get("/", (req, res) => {
-  // Root fallback for Shopify App Proxy
-  if (req.query.guides || req.query.guide) {
-    return handleCareGuides(req, res);
-  }
-
-  res.status(200).type("text/plain").send(
-    [
-      "Care Guides Proxy – Status OK",
-      `Version: ${VERSION}`,
-      `Time: ${nowIso()}`,
-      `Node env: ${NODE_ENV || "unknown"}`,
-    ].join("\n")
-  );
 });
 
-app.get("/care-guides", handleCareGuides);
-
-app.get("/healthz", (req, res) => {
-  res.status(200).json({
-    ok: true,
-    version: VERSION,
-    commit: RENDER_GIT_COMMIT || null,
-    time: nowIso(),
-  });
-});
-
-app.use((req, res) => res.status(404).json({ ok: false, error: "Not found" }));
-
-const port = Number(PORT) || 3000;
-app.listen(port, () => {
-  console.log(`[Care Guides Proxy] ${VERSION} listening on ${port}`);
+// -------------------- Start --------------------
+app.listen(PORT, () => {
+  console.log(`Care Guides proxy listening on port ${PORT}`);
 });

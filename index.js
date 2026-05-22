@@ -1,4 +1,3 @@
-cat > index.js << 'EOF'
 import express from "express";
 
 const app = express();
@@ -195,4 +194,3 @@ app.get("/care-guides", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`Care Guides Proxy listening on port ${PORT}`);
 });
-EOF

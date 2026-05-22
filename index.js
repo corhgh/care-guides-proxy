@@ -3,14 +3,13 @@ import express from "express";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const SHOP = process.env.SHOPIFY_SHOP_DOMAIN;          // e.g. "7a6d38-5.myshopify.com"
-const TOKEN = process.env.SHOPIFY_ADMIN_API_TOKEN;     // shpat_...
+const SHOP = process.env.SHOPIFY_SHOP_DOMAIN;
+const TOKEN = process.env.SHOPIFY_ADMIN_API_TOKEN;
 const API_VERSION = process.env.SHOPIFY_API_VERSION || "2025-01";
 const STOREFRONT_BASE = process.env.STOREFRONT_BASE || "https://belgraveorchids.com.au";
 
 app.use(express.json());
 
-// Simple CORS so your Shopify page can fetch this endpoint
 app.use((req, res, next) => {
   const origin = req.headers.origin;
   const allow = new Set([
@@ -52,7 +51,6 @@ async function shopifyGraphQL(query, variables = {}) {
 
   const text = await resp.text();
 
-  // Shopify sometimes returns 200 with GraphQL errors, sometimes non-200 for auth issues.
   let json;
   try {
     json = JSON.parse(text);
@@ -61,7 +59,6 @@ async function shopifyGraphQL(query, variables = {}) {
   }
 
   if (!resp.ok) {
-    // include whatever Shopify gave us
     const detail = json?.errors || json;
     throw Object.assign(new Error(`Shopify HTTP ${resp.status}`), { shopify: detail });
   }
@@ -96,8 +93,7 @@ const FIND_ORDER_QUERY = `
   }
 `;
 
-// Your metafield is "Blog post" reference => Article.
-// We fetch stable fields (handle + blog.handle) and build the URL ourselves.
+// Fetch product care guide metafield — returns article GID as value
 const PRODUCT_CARE_GUIDE_REFERENCE_QUERY = `
   query ProductCareGuideRefs($ids: [ID!]!) {
     nodes(ids: $ids) {
@@ -109,6 +105,11 @@ const PRODUCT_CARE_GUIDE_REFERENCE_QUERY = `
               handle
               blog { handle }
               title
+              excerpt
+              image {
+                url
+                altText
+              }
             }
           }
         }
@@ -126,6 +127,18 @@ function buildArticleUrl(articleRef) {
   const bHandle = articleRef?.blog?.handle;
   if (!aHandle || !bHandle) return null;
   return `${STOREFRONT_BASE}/blogs/${bHandle}/${aHandle}`;
+}
+
+function buildGuideObject(articleRef) {
+  const url = buildArticleUrl(articleRef);
+  if (!url) return null;
+  return {
+    url,
+    title: articleRef.title || null,
+    excerpt: articleRef.excerpt || null,
+    image: articleRef.image?.url || null,
+    imageAlt: articleRef.image?.altText || articleRef.title || null,
+  };
 }
 
 /* -------------------------
@@ -179,20 +192,29 @@ app.get("/care-guides", async (req, res) => {
       });
     }
 
-    // 2) Fetch care guide references and build URLs
+    // 2) Fetch care guide references with full article data
     const prodData = await shopifyGraphQL(PRODUCT_CARE_GUIDE_REFERENCE_QUERY, {
       ids: uniqueProductIds,
     });
 
-    const guides = dedupe(
-      (prodData?.nodes || [])
-        .map(n => buildArticleUrl(n?.metafield?.reference))
-        .filter(Boolean)
-    );
+    // Dedupe by URL
+    const seen = new Set();
+    const guides = (prodData?.nodes || [])
+      .map(n => buildGuideObject(n?.metafield?.reference))
+      .filter(Boolean)
+      .filter(g => {
+        if (seen.has(g.url)) return false;
+        seen.add(g.url);
+        return true;
+      });
+
+    // Also return plain URL array for backwards compatibility
+    const guideUrls = guides.map(g => g.url);
 
     return res.json({
       ok: true,
-      guides,
+      guides: guideUrls,
+      guideDetails: guides,
       meta: { mode: "order", order: orderNumber, shopify_order: shopifyOrderName, count: guides.length, phase: 2 },
     });
   } catch (err) {
@@ -202,7 +224,7 @@ app.get("/care-guides", async (req, res) => {
       error: "Care guides lookup failed",
       detail: {
         message: err?.message || String(err),
-        shopify_errors: err?.shopify || null, // <-- THIS IS THE IMPORTANT PART
+        shopify_errors: err?.shopify || null,
       },
     });
   }

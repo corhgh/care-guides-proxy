@@ -1,3 +1,4 @@
+cat > index.js << 'EOF'
 import express from "express";
 
 const app = express();
@@ -16,14 +17,12 @@ app.use((req, res, next) => {
     "https://belgraveorchids.com.au",
     "https://www.belgraveorchids.com.au",
   ]);
-
   if (origin && allow.has(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
   }
   res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-
   if (req.method === "OPTIONS") return res.status(204).end();
   next();
 });
@@ -37,9 +36,7 @@ function requireEnv() {
 
 async function shopifyGraphQL(query, variables = {}) {
   requireEnv();
-
   const url = `https://${SHOP}/admin/api/${API_VERSION}/graphql.json`;
-
   const resp = await fetch(url, {
     method: "POST",
     headers: {
@@ -48,31 +45,20 @@ async function shopifyGraphQL(query, variables = {}) {
     },
     body: JSON.stringify({ query, variables }),
   });
-
   const text = await resp.text();
-
   let json;
-  try {
-    json = JSON.parse(text);
-  } catch {
+  try { json = JSON.parse(text); } catch {
     throw new Error(`Shopify returned non-JSON: HTTP ${resp.status} ${text.slice(0, 500)}`);
   }
-
   if (!resp.ok) {
     const detail = json?.errors || json;
     throw Object.assign(new Error(`Shopify HTTP ${resp.status}`), { shopify: detail });
   }
-
   if (json.errors?.length) {
     throw Object.assign(new Error("Shopify GraphQL error"), { shopify: json.errors });
   }
-
   return json.data;
 }
-
-/* -------------------------
-   GraphQL queries
--------------------------- */
 
 const FIND_ORDER_QUERY = `
   query FindOrder($q: String!) {
@@ -93,7 +79,6 @@ const FIND_ORDER_QUERY = `
   }
 `;
 
-// Fetch product care guide metafield — returns article GID as value
 const PRODUCT_CARE_GUIDE_REFERENCE_QUERY = `
   query ProductCareGuideRefs($ids: [ID!]!) {
     nodes(ids: $ids) {
@@ -105,6 +90,7 @@ const PRODUCT_CARE_GUIDE_REFERENCE_QUERY = `
               handle
               blog { handle }
               title
+              summary
               image {
                 url
                 altText
@@ -121,27 +107,29 @@ function dedupe(list) {
   return [...new Set(list.filter(Boolean))];
 }
 
-function buildArticleUrl(articleRef) {
-  const aHandle = articleRef?.handle;
-  const bHandle = articleRef?.blog?.handle;
-  if (!aHandle || !bHandle) return null;
-  return `${STOREFRONT_BASE}/blogs/${bHandle}/${aHandle}`;
+function stripHtml(html) {
+  return (html || "").replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function truncate(str, n) {
+  if (!str) return "";
+  str = str.trim();
+  return str.length > n ? str.slice(0, n).replace(/\s+\S*$/, "") + "…" : str;
 }
 
 function buildGuideObject(articleRef) {
-  const url = buildArticleUrl(articleRef);
-  if (!url) return null;
+  const aHandle = articleRef?.handle;
+  const bHandle = articleRef?.blog?.handle;
+  if (!aHandle || !bHandle) return null;
+  const url = `${STOREFRONT_BASE}/blogs/${bHandle}/${aHandle}`;
   return {
     url,
     title: articleRef.title || null,
+    summary: truncate(stripHtml(articleRef.summary), 160) || null,
     image: articleRef.image?.url || null,
     imageAlt: articleRef.image?.altText || articleRef.title || null,
   };
 }
-
-/* -------------------------
-   Routes
--------------------------- */
 
 app.get("/", (req, res) => res.status(200).send("ok"));
 
@@ -150,28 +138,18 @@ app.get("/care-guides", async (req, res) => {
     const orderParam = (req.query.order || "").toString().trim();
     const rawGuides = (req.query.guides || "").toString().trim();
 
-    // Keep Phase 1 mode working: ?guides=url,url
     if (!orderParam && rawGuides) {
       const urls = dedupe(rawGuides.split(",").map(s => s.trim()).filter(Boolean));
-      return res.json({
-        ok: true,
-        guides: urls,
-        meta: { mode: "guides", count: urls.length, phase: 1 },
-      });
+      return res.json({ ok: true, guides: urls, guideDetails: [], meta: { mode: "guides", count: urls.length, phase: 1 } });
     }
 
     if (!orderParam) {
-      return res.json({
-        ok: true,
-        guides: [],
-        meta: { mode: "none", count: 0, phase: 1 },
-      });
+      return res.json({ ok: true, guides: [], guideDetails: [], meta: { mode: "none", count: 0, phase: 1 } });
     }
 
     const orderNumber = orderParam.replace(/^#/, "");
     const q = `name:#${orderNumber}`;
 
-    // 1) Find order -> product IDs
     const orderData = await shopifyGraphQL(FIND_ORDER_QUERY, { q });
     const edge = orderData?.orders?.edges?.[0];
     const shopifyOrderName = edge?.node?.name || `#${orderNumber}`;
@@ -183,19 +161,11 @@ app.get("/care-guides", async (req, res) => {
     const uniqueProductIds = dedupe(productIds);
 
     if (!uniqueProductIds.length) {
-      return res.json({
-        ok: true,
-        guides: [],
-        meta: { mode: "order", order: orderNumber, shopify_order: shopifyOrderName, count: 0, phase: 2 },
-      });
+      return res.json({ ok: true, guides: [], guideDetails: [], meta: { mode: "order", order: orderNumber, shopify_order: shopifyOrderName, count: 0, phase: 2 } });
     }
 
-    // 2) Fetch care guide references with full article data
-    const prodData = await shopifyGraphQL(PRODUCT_CARE_GUIDE_REFERENCE_QUERY, {
-      ids: uniqueProductIds,
-    });
+    const prodData = await shopifyGraphQL(PRODUCT_CARE_GUIDE_REFERENCE_QUERY, { ids: uniqueProductIds });
 
-    // Dedupe by URL
     const seen = new Set();
     const guides = (prodData?.nodes || [])
       .map(n => buildGuideObject(n?.metafield?.reference))
@@ -206,12 +176,9 @@ app.get("/care-guides", async (req, res) => {
         return true;
       });
 
-    // Also return plain URL array for backwards compatibility
-    const guideUrls = guides.map(g => g.url);
-
     return res.json({
       ok: true,
-      guides: guideUrls,
+      guides: guides.map(g => g.url),
       guideDetails: guides,
       meta: { mode: "order", order: orderNumber, shopify_order: shopifyOrderName, count: guides.length, phase: 2 },
     });
@@ -220,10 +187,7 @@ app.get("/care-guides", async (req, res) => {
     return res.status(500).json({
       ok: false,
       error: "Care guides lookup failed",
-      detail: {
-        message: err?.message || String(err),
-        shopify_errors: err?.shopify || null,
-      },
+      detail: { message: err?.message || String(err), shopify_errors: err?.shopify || null },
     });
   }
 });
@@ -231,3 +195,4 @@ app.get("/care-guides", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`Care Guides Proxy listening on port ${PORT}`);
 });
+EOF

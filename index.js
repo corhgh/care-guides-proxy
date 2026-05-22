@@ -105,7 +105,7 @@ const PRODUCT_CARE_GUIDE_REFERENCE_QUERY = `
               handle
               blog { handle }
               title
-              excerpt
+              contentHtml
               image {
                 url
                 altText
@@ -132,10 +132,15 @@ function buildArticleUrl(articleRef) {
 function buildGuideObject(articleRef) {
   const url = buildArticleUrl(articleRef);
   if (!url) return null;
+  // Strip HTML tags from contentHtml to get plain text excerpt (~200 chars)
+  const rawHtml = articleRef.contentHtml || '';
+  const plainText = rawHtml.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+  const excerpt = plainText.length > 200 ? plainText.slice(0, 200).replace(/\s\S*$/, '') + '…' : plainText;
+
   return {
     url,
     title: articleRef.title || null,
-    excerpt: articleRef.excerpt || null,
+    excerpt: excerpt || null,
     image: articleRef.image?.url || null,
     imageAlt: articleRef.image?.altText || articleRef.title || null,
   };

@@ -1,0 +1,11 @@
+name = "care-guides-proxy"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+
+[vars]
+SHOPIFY_API_VERSION = "2025-01"
+STOREFRONT_BASE = "https://belgraveorchids.com.au"
+
+# Secrets — set via Cloudflare dashboard or:
+# wrangler secret put SHOPIFY_SHOP_DOMAIN
+# wrangler secret put SHOPIFY_ADMIN_API_TOKEN
